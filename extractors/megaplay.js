@@ -103,6 +103,13 @@ function decryptMegaPlaySource(value, script) {
 }
 
 function getMegaPlaySigningKey(script) {
+  const directKey = script.match(/\bBn\s*=\s*["']([^"']+)["']/)?.[1] ??
+    script.match(/\bcdnTokenKey\s*[:=]\s*["']([^"']+)["']/i)?.[1];
+  if (directKey) return directKey;
+
+  const runtimeKey = getMegaPlayRuntimeSigningKey(script);
+  if (runtimeKey) return runtimeKey;
+
   const entry = script.indexOf("const MZzE=");
   if (entry < 0) return null;
 
@@ -120,9 +127,123 @@ function getMegaPlaySigningKey(script) {
   }
 }
 
+function getMegaPlayRuntimeSigningKey(script) {
+  try {
+    const tokenKeyMatch = script.match(
+      /new TextEncoder\(\);return[\s\S]{0,1200}?\[[^\]]+\]\(([A-Za-z_$][\w$]*)\),\{/
+    );
+    const keyVars = new Set(["wxrJ"]);
+    if (tokenKeyMatch) keyVars.add(tokenKeyMatch[1]);
+
+    for (const keyVar of keyVars) {
+      const declaration = new RegExp(`(?:const|let|var)\\s+${keyVar}\\s*=\\s*([^;]+);`);
+      const declarationMatch = script.match(declaration);
+      const runtimeStart = script.search(/;(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*new URLSearchParams\b/);
+
+      if (declarationMatch && runtimeStart > 0) {
+        const context = {
+          console: { log() {}, warn() {}, error() {} },
+          decodeURI,
+          encodeURI,
+          Math,
+          String,
+          Array,
+          Object,
+          RegExp,
+          Error,
+          SyntaxError,
+        };
+        context.globalThis = context;
+        vm.runInNewContext(
+          `${script.slice(0, runtimeStart + 1)};globalThis.__megaPlaySigningKey=${declarationMatch[1]};`,
+          context,
+          { timeout: 5000 }
+        );
+        if (typeof context.__megaPlaySigningKey === "string") return context.__megaPlaySigningKey;
+      }
+    }
+
+    const jqueryStub = {
+      data() { return ""; },
+      hide() {},
+      show() {},
+      on() {},
+      one() {},
+      off() {},
+      html() {},
+      text() {},
+      append() {},
+      find() { return this; },
+      attr() { return ""; },
+      remove() {},
+      css() {},
+      val() { return ""; },
+      addClass() {},
+      removeClass() {},
+    };
+    const context = {
+      console: { log() {}, warn() {}, error() {} },
+      settings: {},
+      window: {
+        location: { hostname: "megaplay.buzz", href: "https://megaplay.buzz/" },
+        crypto: { subtle: crypto.webcrypto?.subtle ?? {} },
+      },
+      document: {
+        querySelector() { return null; },
+        querySelectorAll() { return []; },
+        createElement() {
+          return {
+            style: {},
+            querySelector() { return null; },
+            appendChild() {},
+          };
+        },
+      },
+      localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+      jwplayer() {
+        return {
+          setup() {},
+          on() {},
+          addButton() {},
+          getPlaylistItem() { return {}; },
+          getPosition() { return 0; },
+          seek() {},
+        };
+      },
+      $() { return jqueryStub; },
+      atob(value) { return Buffer.from(String(value), "base64").toString("binary"); },
+      TextEncoder,
+      Uint8Array,
+      ArrayBuffer,
+      URL,
+      URLSearchParams,
+      setTimeout() { return 0; },
+      clearTimeout() {},
+      location: { hostname: "megaplay.buzz", href: "https://megaplay.buzz/" },
+    };
+    context.globalThis = context;
+    context.self = context.window;
+
+    for (const keyVar of keyVars) {
+      const declaration = new RegExp(`((?:const|let|var)\\s+[^;]*\\b${keyVar}\\s*=[^;]+;)`);
+      const instrumented = script.replace(
+        declaration,
+        `$1globalThis.__megaPlaySigningKey=${keyVar};`
+      );
+      try {
+        vm.runInNewContext(instrumented, context, { timeout: 5000 });
+      } catch {}
+      if (typeof context.__megaPlaySigningKey === "string") break;
+    }
+    return typeof context.__megaPlaySigningKey === "string" ? context.__megaPlaySigningKey : null;
+  } catch {
+    return null;
+  }
+}
+
 function signMegaPlayUrl(value, signingKey) {
   if (!value || !signingKey || /[?&]token=/i.test(value)) return value;
-  const match = String(value).match(/\/([a-f0-9]{32})\/([a-f0-9]{32})\//i);
+  const match = String(value).match(/\/([a-z0-9]{32})\/([a-z0-9]{32})\//i);
   if (!match) return value;
 
   const pathKey = `${match[1].toLowerCase()}/${match[2].toLowerCase()}`;
@@ -173,7 +294,10 @@ export async function extractMegaPlayDetails(embedUrl, { fetchImpl = fetch, user
     try { return await fetchText(fetchImpl, url, { "User-Agent": userAgent, "Referer": pageUrl.href }); } catch { return null; }
   }));
   const script = scripts.find((value) => /getSources/i.test(value) && /AES-CBC/i.test(value));
-  const signingScript = scripts.find((value) => value.includes("const kQiC=") && value.includes("[a-f0-9]{32}"));
+  const signingScripts = scripts.filter((value) =>
+    value.includes("[a-f0-9]{32}") &&
+    (value.includes("cdnTokenEnable") || value.includes("token=") || value.includes("HMAC"))
+  );
   if (!script) throw new Error(`MegaPlay client script not found: ${embedUrl}`);
   const { legacy, modern } = getMegaPlayRoutes(script);
   if (!legacy && !modern) throw new Error(`MegaPlay source routes not found: ${embedUrl}`);
@@ -187,7 +311,7 @@ export async function extractMegaPlayDetails(embedUrl, { fetchImpl = fetch, user
     modern ? fetchJson(fetchImpl, buildSourceUrl(pageUrl.origin, modern, fileId), sourceHeaders).catch(() => null) : null,
     legacy ? fetchJson(fetchImpl, buildSourceUrl(pageUrl.origin, legacy, fileId), sourceHeaders).catch(() => null) : null,
   ]);
-  const signingKey = signingScript ? getMegaPlaySigningKey(signingScript) : null;
+  const signingKey = signingScripts.map(getMegaPlaySigningKey).find(Boolean) ?? null;
   const modernUrl = signMegaPlayUrl(
     modernData?.sources?.file ?? decryptMegaPlaySource(modernData?.enc, script),
     signingKey
